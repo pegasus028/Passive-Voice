@@ -1,0 +1,410 @@
+/* ===========================================================================
+   VOICE CONTROL — verify.js
+   Offline pre-flight check. Run with:  node verify.js
+   Loads content.js, the stage files and the three tests exactly as the
+   browser does, then the lenses and lab-data.js, then runs the checks from
+   the engine contract and the release rules (hint, second-try feedback,
+   near-miss distractor, one key, key position and key length balance).
+   Exits non-zero if anything fails, so it can gate a deploy.
+   =========================================================================== */
+var fs = require('fs');
+var vm = require('vm');
+var path = require('path');
+
+/* Run it from anywhere: the content files sit beside this script, unless you
+   are running the copy that lives one level up from the app folder. */
+var DIR = fs.existsSync(path.join(__dirname, 'content.js'))
+  ? __dirname : path.join(__dirname, 'app');
+var OPTIONAL = {};
+var FILES = ['content.js'];
+for (var s = 1; s <= 8; s++) { FILES.push('topic-s' + s + '.js'); OPTIONAL['topic-s' + s + '.js'] = 1; }
+FILES.push('media.js', 'test-1.js', 'test-2.js', 'test-3.js', 'content-export.js');
+['test-1.js', 'test-2.js', 'test-3.js'].forEach(function (f) { OPTIONAL[f] = 1; });
+var STRICT = process.argv.indexOf('--release') >= 0;
+
+var ctx = { window: {}, console: console };
+vm.createContext(ctx);
+FILES.forEach(function (f) {
+  var p = path.join(DIR, f);
+  if (!fs.existsSync(p)) {
+    if (OPTIONAL[f] && !STRICT) { console.log('(skipping missing ' + f + ')'); return; }
+    console.error('MISSING FILE: ' + f); process.exit(1);
+  }
+  try { vm.runInContext(fs.readFileSync(p, 'utf8'), ctx, { filename: f }); }
+  catch (e) { console.error('THROWS: ' + f + ' — ' + e.message); process.exit(1); }
+});
+
+var C = ctx.window.CONTENT;
+var errs = [], warns = [];
+function err(m) { errs.push(m); }
+function warn(m) { warns.push(m); }
+
+var ART_OK = ['chip', 'layers', 'stack', 'clock', 'signal', 'grid', 'lexicon', 'scope', 'sim'];
+var TYPES = ['choose', 'equiv', 'gap', 'cloze', 'read', 'spot', 'order', 'sort', 'build', 'table'];
+var MCQ = { choose: 1, equiv: 1, gap: 1, cloze: 1, read: 1, table: 1 };
+function plainT(s) { return String(s == null ? '' : s).replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, ' ').replace(/[\u2019']/g, "'").toLowerCase().replace(/[.,!?;:"\u201c\u201d]/g, '').replace(/\s+/g, ' ').trim(); }
+function containsPhrase(hay, needle) {
+  hay = ' ' + plainT(hay) + ' '; needle = plainT(needle);
+  if (needle.length < 4) return false;
+  return hay.indexOf(' ' + needle + ' ') >= 0;
+}
+var MOCK_TYPES = ['choose', 'equiv', 'cloze', 'read', 'gap', 'spot', 'table'];
+var ESCAPED_FIELDS_NO_HTML = /<\/?[a-z][^>]*>/i;
+
+var ids = {}, tagsUsed = {}, tagsOnModuleItems = {}, typeCount = {}, levelCount = 0;
+var keyPos = [0, 0, 0, 0];
+var moduleItems = 0, checkItems = 0, mockItems = 0;
+
+function seeId(id, where) {
+  if (!id) return err('item with no id in ' + where);
+  if (ids[id]) err('DUPLICATE id "' + id + '" (' + ids[id] + ' and ' + where + ')');
+  ids[id] = where;
+}
+
+function checkItem(it, where, opts) {
+  opts = opts || {};
+  seeId(it.id, where);
+  if (!it.type) err(it.id + ': no type');
+  else if (TYPES.indexOf(it.type) < 0) err(it.id + ': unknown type "' + it.type + '"');
+  typeCount[it.type] = (typeCount[it.type] || 0) + 1;
+  if (!it.tag) err(it.id + ': no tag');
+  else {
+    tagsUsed[it.tag] = (tagsUsed[it.tag] || 0) + 1;
+    if (!C.REMEDIATION[it.tag]) err(it.id + ': tag "' + it.tag + '" is not in REMEDIATION');
+    if (opts.module) tagsOnModuleItems[it.tag] = true;
+  }
+  if (!it.level) err(it.id + ': no level (CEFR band)');
+  else if (C.CEFR.indexOf(it.level) < 0) warn(it.id + ': level "' + it.level + '" is not one of ' + C.CEFR.join('/'));
+  if (!it.why) err(it.id + ': no why');
+
+  /* answer encoding */
+  if (it.type === 'judge') {
+    if ([0, 1, 2].indexOf(it.answer) < 0) err(it.id + ': judge answer must be 0, 1 or 2');
+    if (it.options) err(it.id + ': judge must not carry an options array');
+  } else if (it.type === 'spot') {
+    if (!Array.isArray(it.words) || !it.words.length) err(it.id + ': spot needs words[]');
+    else if (!(it.answer >= 0 && it.answer < it.words.length)) err(it.id + ': spot answer out of range');
+    if (!it.fix) err(it.id + ': spot has no fix');
+    (it.words || []).forEach(function (w) {
+      if (ESCAPED_FIELDS_NO_HTML.test(w)) err(it.id + ': HTML inside spot words[] (that field is escaped)');
+    });
+  } else if (it.type === 'order') {
+    if (!Array.isArray(it.items) || it.items.length < 3) err(it.id + ': order needs at least 3 items');
+    if ('answer' in it) err(it.id + ': order must NOT have an answer field — the array order is the key');
+    (it.items || []).forEach(function (s) {
+      if (ESCAPED_FIELDS_NO_HTML.test(s)) err(it.id + ': HTML inside order items[] (rendered as text)');
+    });
+  } else if (it.type === 'sort') {
+    if (!Array.isArray(it.bins) || !it.bins.length) err(it.id + ': sort needs bins[]');
+    var keys = (it.bins || []).map(function (b) { return b.key; });
+    (it.items || []).forEach(function (c) {
+      if (keys.indexOf(c.bin) < 0) err(it.id + ': sort card "' + c.text + '" has bin "' + c.bin + '" which is not declared');
+    });
+    (it.bins || []).forEach(function (b) {
+      if (b.hint && ESCAPED_FIELDS_NO_HTML.test(b.hint)) err(it.id + ': HTML inside bins[].hint (escaped)');
+    });
+  } else if (it.type === 'build') {
+    if (!Array.isArray(it.tiles) || !it.tiles.length) err(it.id + ': build needs tiles[]');
+    if (!it.solution) err(it.id + ': build needs a solution');
+    (it.tiles || []).forEach(function (t) {
+      if (ESCAPED_FIELDS_NO_HTML.test(t)) err(it.id + ': HTML inside build tiles[] (textContent)');
+    });
+    /* Tiles may be multi-word chunks, so compare word multisets, not tile lists.
+       The engine checks norm(assembled) === norm(solution), so every word of the
+       solution must be somewhere in the tiles and nothing else may be. */
+    var words = function (s) {
+      return String(s).toLowerCase().replace(/[\u2019']/g, "'")
+        .replace(/[.,!?;:]/g, '').split(/\s+/).filter(Boolean).sort().join('|');
+    };
+    var a = words((it.tiles || []).join(' '));
+    if (words(it.solution) !== a) err(it.id + ': the tiles do not contain exactly the words of the solution');
+    (it.alt || []).forEach(function (x) {
+      if (words(x) !== a) err(it.id + ': alt "' + x + '" does not use exactly the tiles');
+    });
+  } else {
+    if (!Array.isArray(it.options) || it.options.length < 2) err(it.id + ': ' + it.type + ' needs options[]');
+    else if (!(it.answer >= 0 && it.answer < it.options.length)) err(it.id + ': answer index out of range');
+    if (it.options && it.options.length === 4) keyPos[it.answer]++;
+  }
+
+  /* The engine numbers options 1..n on screen. A `why` that counts from zero
+     sends the student to the wrong option after a wrong answer — invisible in
+     the data, glaring on the page. */
+  if (it.options && it.why) {
+    var oref = /\boptions?\s+((?:\d+\s*(?:,|and|or|\/|\u2013|-|\s)\s*)*\d+)/gi, mm;
+    while ((mm = oref.exec(it.why))) {
+      (mm[1].match(/\d+/g) || []).forEach(function (d) {
+        var n = +d;
+        if (n < 1 || n > it.options.length) {
+          err(it.id + ': the why points at "option ' + n + '", but the options are numbered 1\u2013' + it.options.length);
+        }
+      });
+    }
+  }
+
+  /* ---------------------------------------------------- release rules */
+  if (!it.hint || !String(it.hint).trim()) err(it.id + ': no hint (every item needs a rule reminder)');
+  if (MCQ[it.type]) {
+    if (!Array.isArray(it.options) || it.options.length !== 4) err(it.id + ': four-option item does not have exactly 4 options');
+    else {
+      var seenOpt = {};
+      it.options.forEach(function (o, i) {
+        var k = plainT(o);
+        if (seenOpt[k]) err(it.id + ': options ' + seenOpt[k] + ' and ' + (i + 1) + ' are identical');
+        seenOpt[k] = i + 1;
+      });
+      if (!Array.isArray(it.fb) || it.fb.length !== 4 || it.fb.some(function (f) { return !f || !String(f).trim(); }))
+        err(it.id + ': fb must be 4 non-empty strings (second-try feedback per option)');
+      if (!(typeof it.near === 'number' && it.near >= 0 && it.near < 4 && it.near !== it.answer))
+        err(it.id + ': near must be the index (0-3) of the near-miss distractor, not the key');
+      var key = it.options[it.answer];
+      if (it.hint && containsPhrase(it.hint, key)) err(it.id + ': the hint quotes the key ("' + plainT(key) + '")');
+      (it.fb || []).forEach(function (f, i) {
+        if (i !== it.answer && containsPhrase(f, key)) err(it.id + ': fb[' + i + '] (a wrong option) quotes the key — it would give the answer away on the second try');
+      });
+    }
+  }
+  if (it.type === 'spot' && it.words && it.words.length !== 4) warn(it.id + ': spot items should have exactly 4 parts');
+  if (it.type === 'spot' && it.hint && it.fix && containsPhrase(it.hint, it.fix)) err(it.id + ': the hint quotes the fix');
+
+  /* gap and cloze markers */
+  if (it.type === 'cloze' || it.type === 'gap') {
+    if (!it.blank) err(it.id + ': no blank');
+    else if (!/^\(\d+\)$/.test(it.blank)) err(it.id + ': blank "' + it.blank + '" must look like (6), parentheses included');
+    var text = it.type === 'cloze' ? String(it.passage || '')
+      : (it.lines || []).map(function (l) { return l.text; }).join(' ');
+    var want = '___' + it.blank.replace('(', '(').replace(')', ')') + '___';
+    if (text.indexOf('___' + it.blank + '___') < 0) err(it.id + ': the marker ___' + it.blank + '___ does not appear in the text');
+    var stripped = text.replace(/___\(\d+\)___/g, '');
+    if (stripped.indexOf('___') >= 0) warn(it.id + ': a bare ___ in the text renders as "?"');
+  }
+
+  /* escaped fields must be plain */
+  ['passage', 'source'].forEach(function (f) {
+    if (it[f] && ESCAPED_FIELDS_NO_HTML.test(it[f])) err(it.id + ': HTML inside ' + f + ' (that field is escaped — use \\n\\n for a paragraph)');
+  });
+  (it.lines || []).forEach(function (l) {
+    if (ESCAPED_FIELDS_NO_HTML.test(l.text) || ESCAPED_FIELDS_NO_HTML.test(l.who)) err(it.id + ': HTML inside a dialogue line (escaped)');
+  });
+}
+
+/* Names, codes, blurbs and bands are printed with esc(), so any markup in them
+   shows as literal <em> on screen. This is the easiest mistake to make and the
+   most visible, so it is an error, not a warning. */
+function plain(o, fields, where) {
+  fields.forEach(function (f) {
+    if (o && o[f] && ESCAPED_FIELDS_NO_HTML.test(String(o[f]))) {
+      err(where + '.' + f + ': HTML here is printed literally \u2014 this field is escaped');
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ topics */
+if (!C || !C.TOPICS) { console.error('window.CONTENT.TOPICS is missing'); process.exit(1); }
+C.TOPICS.forEach(function (t) {
+  var w = t.id;
+  ['id', 'n', 'code', 'art', 'name', 'cefr', 'blurb'].forEach(function (f) {
+    if (t[f] === undefined || t[f] === '') err(w + ': topic has no ' + f);
+  });
+  if (ART_OK.indexOf(t.art) < 0) err(w + ': art "' + t.art + '" is not one of ' + ART_OK.join('/'));
+  plain(t, ['name', 'code', 'blurb', 'cefr'], w);
+  if (!t.levels || !t.levels.length) return err(w + ': no levels');
+  t.levels.forEach(function (lv) {
+    levelCount++;
+    ['id', 'n', 'name', 'cefr'].forEach(function (f) {
+      if (lv[f] === undefined || lv[f] === '') err(lv.id + ': level has no ' + f);
+    });
+    plain(lv, ['name', 'cefr', 'blurb'], lv.id);
+    if (!lv.subs || !lv.subs.length) return err(lv.id + ': no subs');
+    if (lv.subs.length !== 3) warn(lv.id + ': ' + lv.subs.length + ' modules — the UI copy says "all three modules"');
+    lv.subs.forEach(function (s) {
+      ['id', 'name', 'cefr'].forEach(function (f) {
+        if (!s[f]) err(s.id + ': module has no ' + f);
+      });
+      plain(s, ['name', 'cefr'], s.id);
+      if (!s.theory) err(s.id + ': no theory — the app throws on this');
+      else {
+        if (!s.theory.key) err(s.id + ': theory has no key');
+        if (!Array.isArray(s.theory.body) || !s.theory.body.length) err(s.id + ': theory has no body');
+        if (!s.theory.simple) warn(s.id + ': no theory.simple — the "explain simply" button will do nothing');
+        (s.theory.examples || []).forEach(function (x, i) {
+          if (!x.s || !x.g) err(s.id + ': example ' + (i + 1) + ' needs both s and g');
+          else if (ESCAPED_FIELDS_NO_HTML.test(x.g)) err(s.id + ': HTML inside examples[' + i + '].g (escaped)');
+        });
+      }
+      if (!s.items || !s.items.length) return err(s.id + ': no items');
+      if (s.items.length !== 5) warn(s.id + ': ' + s.items.length + ' items (5 is the house size; the 60% pass mark assumes it)');
+      s.items.forEach(function (it) { moduleItems++; checkItem(it, s.id, { module: true }); });
+    });
+    if (!lv.check) return err(lv.id + ': NO CHECK — engine.js throws at load');
+    if (!lv.check.id || !lv.check.name) err(lv.id + ': check needs an id and a name');
+    plain(lv.check, ['name'], lv.check.id);
+    if (!lv.check.items || !lv.check.items.length) err(lv.id + ': check has no items');
+    else {
+      if (lv.check.items.length !== 6) warn(lv.check.id + ': ' + lv.check.items.length + ' items (6 is the house size)');
+      lv.check.items.forEach(function (it) { checkItems++; checkItem(it, lv.check.id, {}); });
+    }
+  });
+});
+
+/* ------------------------------------------------------------------- mocks */
+(C.MOCKS || []).forEach(function (m) {
+  ['id', 'name', 'minutes'].forEach(function (f) {
+    if (!m[f]) err('mock ' + m.id + ': no ' + f);
+  });
+  plain(m, ['name', 'blurb'], m.id);
+  if (!m.sections || !m.sections.length) return err('mock ' + m.id + ': no sections');
+  var codes = {}, marks = 0, n = 0;
+  m.sections.forEach(function (sec) {
+    ['code', 'part', 'title', 'instructions'].forEach(function (f) {
+      if (!sec[f]) err(m.id + '/' + sec.code + ': section has no ' + f);
+    });
+    plain(sec, ['part', 'title', 'instructions'], m.id + '/' + sec.code);
+    if (sec.part && sec.part.indexOf('PART ') !== 0) warn(m.id + '/' + sec.code + ': part should begin with "PART "');
+    if (typeof sec.points !== 'number') err(m.id + '/' + sec.code + ': section needs numeric points');
+    if (codes[sec.code]) err(m.id + ': two sections share the code "' + sec.code + '" — their scores will merge');
+    codes[sec.code] = 1;
+    if (sec.instructions && ESCAPED_FIELDS_NO_HTML.test(sec.instructions)) err(m.id + '/' + sec.code + ': HTML in instructions (escaped)');
+    (sec.items || []).forEach(function (it) {
+      mockItems++; n++; marks += sec.points;
+      if (MOCK_TYPES.indexOf(it.type) < 0) err(it.id + ': type "' + it.type + '" cannot record an answer in a test — use ' + MOCK_TYPES.join('/'));
+      checkItem(it, m.id + '/' + sec.code, {});
+      if (!/^[a-z0-9]+-\d+$/.test(String(it.id))) warn(it.id + ': test item ids should look like m1-7');
+    });
+  });
+  console.log('  ' + m.id + ' "' + m.name + '": ' + n + ' items, ' + marks + ' marks, ' + m.minutes + ' min');
+  if (m.total && m.total !== marks) warn(m.id + ': declared total ' + m.total + ' but the sections sum to ' + marks + ' (the app uses the computed figure)');
+});
+
+/* ------------------------------------------------------- cross-cutting */
+Object.keys(C.REMEDIATION).forEach(function (tag) {
+  if (!tagsUsed[tag]) err('REMEDIATION tag "' + tag + '" is never used — tag coverage can never reach 100%');
+});
+Object.keys(tagsUsed).forEach(function (tag) {
+  if (!tagsOnModuleItems[tag]) err('tag "' + tag + '" is only used in checks/tests — a miss on it will route the student nowhere');
+});
+var topRank = C.RANKS[C.RANKS.length - 1];
+if (C.RANKS[0].min !== 0) err('RANKS must start at min 0');
+if (STRICT && topRank.min !== levelCount) err('the top rank needs min ' + levelCount + ' (one per stage check), not ' + topRank.min);
+var BADGE_IDS = ['poweron', 'streak3', 'streak7', 'streak14', 'allgreen', 'triple', 'nohelp',
+  'recovered', 'run10', 'reflight', 'quick', 'sim1', 'sim70', 'simall', 'director'];
+var got = C.BADGES.map(function (b) { return b.id; });
+BADGE_IDS.forEach(function (b) { if (got.indexOf(b) < 0) err('badge "' + b + '" is missing — it can never be awarded'); });
+got.forEach(function (b) { if (BADGE_IDS.indexOf(b) < 0) err('badge "' + b + '" has no test in engine.js — it will show as permanently locked'); });
+
+/* media keys must be topic ids */
+var topicIds = C.TOPICS.map(function (t) { return t.id; });
+Object.keys(ctx.MEDIA || {}).forEach(function (k) {
+  if (topicIds.indexOf(k) < 0 && STRICT) err('MEDIA key "' + k + '" is not a stage id');
+});
+topicIds.forEach(function (id) {
+  if (!(ctx.MEDIA || {})[id]) warn('no MEDIA entry for stage ' + id);
+});
+
+/* Keys bunched on one position let a student score by habit rather than by
+   grammar. rebalance.js fixes this; the check stops it drifting back. */
+(function () {
+  var n = keyPos[0] + keyPos[1] + keyPos[2] + keyPos[3];
+  if (n < 40) return;
+  keyPos.forEach(function (c, i) {
+    var share = c / n;
+    if (share > 0.33) warn('option ' + (i + 1) + ' holds ' + Math.round(share * 100) +
+      '% of the four-option keys (' + c + ' of ' + n + ') \u2014 run rebalance.js');
+    if (share < 0.17) warn('option ' + (i + 1) + ' holds only ' + Math.round(share * 100) +
+      '% of the four-option keys (' + c + ' of ' + n + ') \u2014 run rebalance.js');
+  });
+})();
+
+/* ------------------------------------------- lesson lenses and Voice Lab */
+(function () {
+  var HTML = /<\/?[a-z][^>]*>/i;
+  var lensFiles = fs.readdirSync(DIR).filter(function (f) { return /^lenses-s\d+\.js$/.test(f); }).sort();
+  lensFiles.concat(['lab-data.js']).forEach(function (f) {
+    var fp = path.join(DIR, f);
+    if (!fs.existsSync(fp)) return warn(f + ' is missing — that feature will simply not appear');
+    try { vm.runInContext(fs.readFileSync(fp, 'utf8'), ctx, { filename: f }); }
+    catch (e) { err('THROWS: ' + f + ' — ' + e.message); }
+  });
+  var L = ctx.LENSES || {}, subIds = {};
+  C.TOPICS.forEach(function (t) { t.levels.forEach(function (lv) { lv.subs.forEach(function (sb) { subIds[sb.id] = 1; }); }); });
+  Object.keys(L).forEach(function (id) {
+    var x = L[id];
+    if (!subIds[id]) return err('lenses: "' + id + '" is not a module id');
+    if (x.thai && HTML.test(x.thai)) err('lenses ' + id + ': HTML in thai (that field is escaped)');
+    if (x.map) {
+      if (!x.map.center || !Array.isArray(x.map.branches)) err('lenses ' + id + ': map needs center + branches');
+      else x.map.branches.forEach(function (b) {
+        if (!b.label || !Array.isArray(b.leaves)) err('lenses ' + id + ': map branch needs label + leaves');
+        [b.label].concat(b.leaves || []).forEach(function (t) { if (HTML.test(t || '')) err('lenses ' + id + ': HTML in map text'); });
+      });
+    }
+    if (x.story && !(Array.isArray(x.story.panels) && x.story.panels.length)) err('lenses ' + id + ': story has no panels');
+    if (x.story) (x.story.panels || []).forEach(function (p) { if (HTML.test(p.who || '')) err('lenses ' + id + ': HTML in story who'); });
+    if (x.chant && !(Array.isArray(x.chant.lines) && x.chant.lines.length)) err('lenses ' + id + ': chant has no lines');
+    if (x.moves && !Array.isArray(x.moves)) err('lenses ' + id + ': moves must be a list');
+  });
+  Object.keys(subIds).forEach(function (id) { if (!L[id]) warn('module ' + id + ' has no lesson lenses'); });
+
+  var LB = ctx.LAB;
+  if (LB) {
+    var seen = {};
+    function uid(r) { if (seen[r.id]) err('lab-data.js: duplicate id ' + r.id); seen[r.id] = 1; }
+    (LB.switch || []).forEach(function (d) {
+      uid(d);
+      ['doer', 'doerObj', 'obj'].forEach(function (f) { if (!d[f]) err('lab-data.js ' + d.id + ': switch scene needs ' + f); });
+      ['base', 's', 'past', 'pp', 'ing'].forEach(function (f) { if (!d.v || !d.v[f]) err('lab-data.js ' + d.id + ': verb form ' + f + ' missing'); });
+      if (['keep', 'drop'].indexOf(d.agent) < 0) err('lab-data.js ' + d.id + ': agent must be keep or drop');
+    });
+    (LB.desk || []).forEach(function (d) {
+      uid(d);
+      if (!Array.isArray(d.options) || d.options.length !== 4) return err('lab-data.js ' + d.id + ': desk case needs 4 options');
+      var out = {};
+      (d.steps || []).forEach(function (s, i) {
+        if (!(s.answer >= 0 && s.answer < (s.choices || []).length)) err('lab-data.js ' + d.id + ': step ' + (i + 1) + ' answer out of range');
+        (s.out || []).forEach(function (o) { if (o === d.answer) err('lab-data.js ' + d.id + ': step ' + (i + 1) + ' eliminates the key'); out[o] = 1; });
+      });
+      var left = [0, 1, 2, 3].filter(function (i) { return !out[i]; });
+      if (left.length !== 1 || left[0] !== d.answer) err('lab-data.js ' + d.id + ': the steps must eliminate exactly the three wrong options (left: ' + left.join(',') + ')');
+      if ((d.stem || '').split('___').length !== 2) err('lab-data.js ' + d.id + ': stem needs exactly one ___');
+    });
+    (LB.doer || []).forEach(function (d) {
+      uid(d);
+      if (['active', 'passive'].indexOf(d.answer) < 0) err('lab-data.js ' + d.id + ': bad answer');
+      if ((d.sentence || '').split('___').length !== 2) err('lab-data.js ' + d.id + ': sentence needs exactly one ___');
+    });
+    (LB.trap || []).forEach(function (d) {
+      uid(d);
+      if (typeof d.ok !== 'boolean') err('lab-data.js ' + d.id + ': ok must be true or false');
+      if (!d.ok && !d.fix) err('lab-data.js ' + d.id + ': a wrong sentence needs a fix');
+    });
+    (LB.service || []).forEach(function (d) {
+      uid(d);
+      if (!Array.isArray(d.options) || d.options.length !== 4 || !(d.answer >= 0 && d.answer < 4)) err('lab-data.js ' + d.id + ': service needs 4 options and an answer 0-3');
+    });
+    var TH = ctx.PV_CARD_THEMES || {};
+    (ctx.PV_CARDS || []).forEach(function (c, i) {
+      if (!Array.isArray(c) || c.length !== 7) err('lab-data.js: card ' + i + ' needs 7 fields');
+      else if (!TH[c[3]]) err('lab-data.js: card "' + c[0] + '" has unknown theme ' + c[3]);
+    });
+    console.log('lenses: ' + Object.keys(L).length + ' modules · lab: ' + (LB.switch || []).length + ' switch scenes, ' +
+      (LB.desk || []).length + ' desk cases, ' + (LB.doer || []).length + ' doer, ' + (LB.trap || []).length + ' trap, ' +
+      (LB.service || []).length + ' service, ' + (ctx.PV_CARDS || []).length + ' cards');
+  }
+})();
+
+/* ------------------------------------------------------------------ report */
+console.log('');
+console.log('stages ' + C.TOPICS.length + ' · levels ' + levelCount + ' · modules ' + (levelCount * 3) +
+  ' · checks ' + levelCount + ' · tests ' + (C.MOCKS || []).length);
+console.log('items: ' + moduleItems + ' module + ' + checkItems + ' check + ' + mockItems + ' test = ' +
+  (moduleItems + checkItems + mockItems));
+console.log('tags: ' + Object.keys(C.REMEDIATION).length + ' declared, ' + Object.keys(tagsUsed).length + ' used');
+console.log('keys at option 1/2/3/4: ' + keyPos.join(' / '));
+console.log('types: ' + Object.keys(typeCount).sort().map(function (k) { return k + ' ' + typeCount[k]; }).join(' · '));
+console.log('');
+warns.forEach(function (w) { console.log('WARN  ' + w); });
+errs.forEach(function (e) { console.log('ERROR ' + e); });
+console.log('');
+console.log(errs.length ? (errs.length + ' error(s), ' + warns.length + ' warning(s) — NOT READY')
+  : ('CLEAN' + (warns.length ? ' — ' + warns.length + ' warning(s) to look at' : '')));
+process.exit(errs.length ? 1 : 0);
